@@ -1,0 +1,49 @@
+name: News bot
+
+# @fflensapp: posts fantasy impact of injury-status changes and waiver spikes (newsbot.py).
+# Every 5 minutes (GitHub may run it a few minutes late); without the X_* secrets it only logs what it would post.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      check:
+        description: "Only verify the X credentials (no post)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newsbot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Restore last run's state
+        uses: actions/cache/restore@v4
+        with:
+          path: newsbot-state.json
+          key: newsbot-${{ github.run_id }}
+          restore-keys: newsbot-
+      - name: Check Sleeper and post
+        run: python3 newsbot.py ${{ inputs.check && '--check' || '' }}
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: newsbot-state.json
+          key: newsbot-${{ github.run_id }}
