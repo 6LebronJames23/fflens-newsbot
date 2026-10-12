@@ -1,10 +1,11 @@
 name: News bot
 
-# @fflensapp: posts fantasy impact of injury-status changes and waiver spikes (newsbot.py).
-# Every 5 minutes (GitHub may run it a few minutes late); without the X_* secrets it only logs what it would post.
+# @fflensapp: posts fantasy impact of injury-status changes, waiver spikes and two weekly roundups (newsbot.py).
+# GitHub's cron runs small repos only every few hours, so each run stays up ~5.5 hours checking every 5 minutes,
+# then starts the next run itself. The cron below is only a backstop in case the chain ever breaks.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 */3 * * *"
   workflow_dispatch:
     inputs:
       check:
@@ -14,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: newsbot
@@ -22,7 +24,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,8 +36,8 @@ jobs:
           path: newsbot-state.json
           key: newsbot-${{ github.run_id }}
           restore-keys: newsbot-
-      - name: Check Sleeper and post
-        run: python3 newsbot.py ${{ inputs.check && '--check' || '' }}
+      - name: Check Sleeper and post (every 5 minutes for ~5.5 hours)
+        run: python3 -u newsbot.py ${{ inputs.check && '--check' || '--loop 330' }}
         env:
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
@@ -47,3 +49,8 @@ jobs:
         with:
           path: newsbot-state.json
           key: newsbot-${{ github.run_id }}
+      - name: Start the next run
+        if: ${{ !inputs.check && !cancelled() }}
+        run: gh workflow run newsbot.yml -R "${{ github.repository }}" --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}

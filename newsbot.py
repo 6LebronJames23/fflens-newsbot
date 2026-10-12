@@ -2,7 +2,7 @@
 """@fflensapp news bot: posts fantasy impact when a relevant player's injury status changes on Sleeper,
 or when someone becomes the most-added player in the last 6 hours.
 
-Runs every 5 minutes from GitHub Actions (.github/workflows/newsbot.yml). State (last seen statuses,
+Runs on GitHub Actions: each run checks every 5 minutes for ~5.5 hours, then starts the next run (.github/workflows/newsbot.yml). State (last seen statuses,
 what was already posted) lives in newsbot-state.json, carried between runs with the Actions cache.
 Without X credentials it only prints what it would post (dry run).
 Posts carry NO links on purpose: on X's pay-per-use API a post with a URL costs ~$0.20 vs ~$0.015 without (2026). Credentials (OAuth 1.0a, user context
@@ -107,8 +107,22 @@ def main(dry):
     daily = state.get("daily", {}) if state.get("day") == today else {}
     sent_today = daily.get("n", 0)
 
-    players = fetch("https://api.sleeper.app/v1/players/nfl")
-    red, dyn = ranks(False), ranks(True)
+    # Sleeper asks that /players/nfl (5 MB) be fetched at most once a day: keep a slim copy in state,
+    # and read live injury statuses from the much smaller weekly projections feed instead
+    pmap = state.get("pmap")
+    if not pmap or state.get("pmap_day") != today:
+        raw = fetch("https://api.sleeper.app/v1/players/nfl")
+        pmap = {pid: {"full_name": p.get("full_name") or f"{p.get('first_name') or ''} {p.get('last_name') or ''}".strip(), "position": p.get("position"), "team": p.get("team")}
+                for pid, p in raw.items() if p.get("position") in POS4 and p.get("team")}
+    nfl = fetch("https://api.sleeper.app/v1/state/nfl")
+    q = "&".join(f"position[]={x}" for x in POS4)
+    proj = fetch(f"https://api.sleeper.app/projections/nfl/{nfl.get('season')}/{max(1, int(nfl.get('week') or 1))}?season_type=regular&{q}") or []
+    inj = {r["player_id"]: (r.get("player") or {}) for r in proj if r.get("player_id")}
+    players = {pid: {**v, "injury_status": inj.get(pid, {}).get("injury_status"), "injury_body_part": inj.get(pid, {}).get("injury_body_part")} for pid, v in pmap.items()}
+    # trade values change slowly: refresh hourly
+    if not state.get("ranks") or now.timestamp() - state.get("ranks_ts", 0) > 3600:
+        state["ranks"], state["ranks_ts"] = {"red": ranks(False), "dyn": ranks(True)}, now.timestamp()
+    red, dyn = state["ranks"]["red"], state["ranks"]["dyn"]
     relevant = lambda pid, pos: (pid in red and red[pid]["prank"] <= REL.get(pos, 0)) or (pid in dyn and dyn[pid]["rank"] <= 150)
     adds24 = {t["player_id"]: t["count"] for t in fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=200")}
     adds6 = fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=6&limit=25")
@@ -134,7 +148,7 @@ def main(dry):
     status_now = {}
     for pid, p in players.items():
         pos = p.get("position")
-        if pos not in POS4 or not p.get("team"):
+        if pos not in POS4 or not p.get("team") or pid not in inj:
             continue
         st = p.get("injury_status")
         status_now[pid] = st
@@ -214,7 +228,8 @@ def main(dry):
 
     cutoff = now - datetime.timedelta(days=14)
     posted = {k: v for k, v in posted.items() if datetime.datetime.fromisoformat(v) > cutoff}
-    json.dump({"status": status_now, "posted": posted, "day": today, "daily": {"n": sent_today}}, open(STATE, "w"))
+    json.dump({"status": status_now, "posted": posted, "day": today, "daily": {"n": sent_today}, "pmap": pmap, "pmap_day": today,
+               "ranks": state["ranks"], "ranks_ts": state["ranks_ts"]}, open(STATE, "w"))
     verb = "posted" if live else "would post"
     print(f"checked {len(status_now)} players; {len(events)} candidate events; {len(out)} {verb}{' (first run: snapshot saved)' if not prev else ''}")
 
@@ -222,5 +237,17 @@ def main(dry):
 if __name__ == "__main__":
     if "--check" in sys.argv:
         check_x()
+    elif "--loop" in sys.argv:
+        # stay up for N minutes, checking every 5 (GitHub's own cron is too unreliable on small repos)
+        end = time.time() + 60 * int(sys.argv[sys.argv.index("--loop") + 1])
+        while True:
+            try:
+                main(dry="--dry" in sys.argv)
+            except Exception as e:
+                print("run failed:", repr(e)[:300])
+            sys.stdout.flush()
+            if time.time() + 300 > end:
+                break
+            time.sleep(300)
     else:
         main(dry="--dry" in sys.argv)
