@@ -46,7 +46,7 @@ def ranks(dyn):
         if not sid or pos not in POS4:
             continue
         pc[pos] = pc.get(pos, 0) + 1
-        out[sid] = {"prank": pc[pos], "rank": len(out) + 1, "v": r["value"]}
+        out[sid] = {"prank": pc[pos], "rank": len(out) + 1, "v": r["value"], "trend": r.get("trend30Day") or 0}
     return out
 
 
@@ -174,6 +174,24 @@ def main(dry):
         text = (f"📈 {name} ({pos}, {team}) is the {'most' if i == 0 else 'second-most'}-added player on Sleeper right now: {n:,} adds in the last 6 hours{why}.\n\n"
                 f"Top adds + FAAB help for your league: link in bio")
         events.append((300 - i, key, text))
+
+    # weekly roundups (once per ISO week): Tuesday = top waiver adds, Thursday = dynasty market movers
+    wk = "%d-%02d" % now.isocalendar()[:2]
+    if now.weekday() == 1 and now.hour >= 15:
+        adds48 = fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=48&limit=40")
+        top = [(t["player_id"], t["count"]) for t in adds48 if info(t["player_id"])[1] in POS4][:5]
+        if len(top) == 5:
+            lines = [f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]}): {n:,} adds" for i, (pid, n) in enumerate(top)]
+            events.append((2000, f"weekly:waivers:{wk}", "🧾 Top waiver adds across Sleeper leagues this week:\n\n" + "\n".join(lines) + "\n\nWho are you spending FAAB on? Bid help for your league: link in bio"))
+    if now.weekday() == 3 and now.hour >= 15:
+        mv = [(pid, x) for pid, x in dyn.items() if x["trend"] and x["v"] - x["trend"] > 0 and x["v"] >= 1500]
+        pct = lambda x: round(100 * x["trend"] / (x["v"] - x["trend"]))
+        up = sorted(mv, key=lambda t: -t[1]["trend"])[:3]
+        dn = sorted(mv, key=lambda t: t[1]["trend"])[:3]
+        if len(up) == 3 and len(dn) == 3 and up[0][1]["trend"] > 0 and dn[0][1]["trend"] < 0:
+            fmt = lambda t: f"{info(t[0])[0]} ({info(t[0])[1]}) {'+' if t[1]['trend'] > 0 else ''}{pct(t[1])}%"
+            events.append((1900, f"weekly:movers:{wk}", "📈 Dynasty market risers, last 30 days (Superflex):\n" + "\n".join("▲ " + fmt(t) for t in up)
+                           + "\n\n📉 Fallers:\n" + "\n".join("▼ " + fmt(t) for t in dn) + "\n\nBuy low or sell high? Full list: link in bio"))
 
     out = []
     for score, key, text in sorted(events, key=lambda e: -e[0]):
