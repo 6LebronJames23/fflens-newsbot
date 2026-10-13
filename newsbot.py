@@ -19,8 +19,9 @@ POS4 = ["QB", "RB", "WR", "TE"]
 BAD = {"Out", "IR", "Doubtful", "PUP", "Sus"}
 OK_BEFORE = {None, "", "Questionable", "Probable"}
 # fantasy-relevant = inside these position ranks (redraft) or the dynasty Superflex top 150
-REL = {"QB": 24, "RB": 48, "WR": 60, "TE": 20}
-PER_RUN, PER_DAY = 3, 8
+REL = {"QB": 28, "RB": 60, "WR": 72, "TE": 24}
+STAR = {"QB": 8, "RB": 12, "WR": 12, "TE": 8}  # stars: even a Questionable tag is news
+PER_RUN, PER_DAY = 3, 15
 STATUS_TXT = {"Out": "ruled OUT", "IR": "placed on IR", "Doubtful": "listed as DOUBTFUL", "PUP": "placed on PUP", "Sus": "suspended"}
 CTX = ssl.create_default_context(cafile="/etc/ssl/cert.pem") if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem") else None
 
@@ -123,7 +124,7 @@ def main(dry):
     if not state.get("ranks") or now.timestamp() - state.get("ranks_ts", 0) > 3600:
         state["ranks"], state["ranks_ts"] = {"red": ranks(False), "dyn": ranks(True)}, now.timestamp()
     red, dyn = state["ranks"]["red"], state["ranks"]["dyn"]
-    relevant = lambda pid, pos: (pid in red and red[pid]["prank"] <= REL.get(pos, 0)) or (pid in dyn and dyn[pid]["rank"] <= 150)
+    relevant = lambda pid, pos: (pid in red and red[pid]["prank"] <= REL.get(pos, 0)) or (pid in dyn and dyn[pid]["rank"] <= 200)
     adds24 = {t["player_id"]: t["count"] for t in fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=200")}
     adds6 = fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=6&limit=25")
 
@@ -166,26 +167,31 @@ def main(dry):
                     f"Fantasy impact: {ctx_line(pid, pos)}{nxt}\n\nFull breakdown + trade values: link in bio")
             score = 1000 - min(red.get(pid, {}).get("prank", 99), dyn.get(pid, {}).get("prank", 99))
             events.append((score, f"inj:{pid}:{st}:{today}", text))
+        elif st == "Questionable" and before in (None, "") and red.get(pid, {}).get("prank", 99) <= STAR[pos]:
+            body = p.get("injury_body_part")
+            text = (f"⚠️ {name} ({pos}, {team}) is QUESTIONABLE{f' ({body.lower()})' if body else ''}.\n\n"
+                    f"Fantasy impact: {ctx_line(pid, pos)}. Have a backup plan before lock.")
+            events.append((800 - red[pid]["prank"], f"q:{pid}:{today}", text))
         elif before in BAD and st in (None, "") and (red.get(pid, {}).get("prank", 99) <= REL[pos] // 2):
             text = f"✅ {name} ({pos}, {team}) no longer carries an injury designation on Sleeper.\n\n{ctx_line(pid, pos)}. Back in lineups?"
             events.append((500 - red[pid]["prank"], f"back:{pid}:{today}", text))
 
     # waiver spikes: top of the 6-hour adds list
-    for i, t in enumerate(adds6[:2]):
+    for i, t in enumerate(adds6[:3]):
         pid, n = t["player_id"], t["count"]
         name, pos, team = info(pid)
-        if pos not in POS4 or n < 25000:
+        if pos not in POS4 or n < 15000:
             continue
         key = f"spike:{pid}"
         last = posted.get(key)
-        if last and (now - datetime.datetime.fromisoformat(last)).days < 4:
+        if last and (now - datetime.datetime.fromisoformat(last)).days < 3:
             continue
         why = ""
         for m, p in players.items():  # injured starter at the same spot explains most spikes
             if p.get("team") == team and p.get("position") == pos and m != pid and p.get("injury_status") in BAD and m in red and red[m]["prank"] <= REL[pos]:
                 why = f" with {info(m)[0]} {STATUS_TXT.get(p['injury_status'], p['injury_status'])}"
                 break
-        text = (f"📈 {name} ({pos}, {team}) is the {'most' if i == 0 else 'second-most'}-added player on Sleeper right now: {n:,} adds in the last 6 hours{why}.\n\n"
+        text = (f"📈 {name} ({pos}, {team}) is the {['most', 'second-most', 'third-most'][i]}-added player on Sleeper right now: {n:,} adds in the last 6 hours{why}.\n\n"
                 f"Top adds + FAAB help for your league: link in bio")
         events.append((300 - i, key, text))
 
@@ -206,6 +212,30 @@ def main(dry):
             fmt = lambda t: f"{info(t[0])[0]} ({info(t[0])[1]}) {'+' if t[1]['trend'] > 0 else ''}{pct(t[1])}%"
             events.append((1900, f"weekly:movers:{wk}", "📈 Dynasty market risers, last 30 days (Superflex):\n" + "\n".join("▲ " + fmt(t) for t in up)
                            + "\n\n📉 Fallers:\n" + "\n".join("▼ " + fmt(t) for t in dn) + "\n\nBuy low or sell high? Full list: link in bio"))
+
+    if now.weekday() == 0 and now.hour >= 15:  # Monday: who's getting cut
+        drops = fetch("https://api.sleeper.app/v1/players/nfl/trending/drop?lookback_hours=24&limit=40")
+        top = [(t["player_id"], t["count"]) for t in drops if info(t["player_id"])[1] in POS4][:5]
+        if len(top) == 5:
+            events.append((1850, f"weekly:drops:{wk}", "✂️ Most-dropped players across Sleeper leagues in the last 24 hours:\n\n"
+                           + "\n".join(f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]}): {n:,} drops" for i, (pid, n) in enumerate(top)) + "\n\nCut too early, or right call?"))
+    if now.weekday() == 2 and now.hour >= 15:  # Wednesday: top projected at each position
+        pts = {r["player_id"]: (r.get("stats") or {}).get("pts_ppr") or 0 for r in proj if r.get("player_id")}
+        lines = []
+        for pos in POS4:
+            best = sorted((pid for pid in pts if pid in pmap and pmap[pid]["position"] == pos), key=lambda x: -pts[x])[:3]
+            if best:
+                lines.append(f"{pos}: " + ", ".join(f"{info(x)[0]} ({pts[x]:.1f})" for x in best))
+        if len(lines) == 4:
+            events.append((1800, f"weekly:proj:{wk}", f"📊 Top projected players for week {nfl.get('week')} (PPR):\n\n" + "\n".join(lines) + "\n\nStart/sit for your own lineup: link in bio"))
+    if now.weekday() == 4 and now.hour >= 18:  # Friday: questionable stars heading into the weekend
+        qs = sorted((pid for pid, p in players.items() if p.get("injury_status") == "Questionable" and pid in red and red[pid]["prank"] <= STAR.get(p["position"], 0)), key=lambda x: red[x]["rank"])[:6]
+        if len(qs) >= 3:
+            events.append((1800, f"weekly:questionable:{wk}", "⚠️ Questionable heading into the weekend:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in qs) + "\n\nWho are you benching?"))
+    if now.weekday() == 6 and 15 <= now.hour < 17:  # Sunday before the 1pm ET games: today's OUT list
+        outs = sorted((pid for pid, p in players.items() if p.get("injury_status") in ("Out", "Doubtful") and relevant(pid, p["position"]) and pid in red), key=lambda x: red[x]["rank"])[:8]
+        if len(outs) >= 3:
+            events.append((1950, f"weekly:sunday:{wk}", "🚫 Out or doubtful today, fantasy-relevant:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in outs) + "\n\nCheck your lineups before kickoff."))
 
     out = []
     for score, key, text in sorted(events, key=lambda e: -e[0]):
