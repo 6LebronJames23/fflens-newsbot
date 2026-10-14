@@ -74,9 +74,9 @@ def check_x():
         print("X credentials check failed:", e.code, e.read().decode()[:300])
 
 
-def post_x(text):
+def post_x(text, allow_link=False):
     import re
-    if re.search(r"https?://|\b[\w-]+\.(app|com|io|net|org|ly|co)\b", text):
+    if not allow_link and re.search(r"https?://|\b[\w-]+\.(app|com|io|net|org|ly|co)\b", text):
         return 0, "refused: post contains a link (~13x the API price)"
     k, ks, t, ts = (os.environ.get(x) for x in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"))
     url = "https://api.x.com/2/tweets"
@@ -256,9 +256,18 @@ def main(dry):
 
     if not prev:
         out = []  # first run: just learn everyone's current status
+    # one-off announcements from scheduled.json: [{"key", "at" (UTC ISO), "text", "link": true}], posted once within 6h of "at"
+    sched = os.path.join(HERE, "scheduled.json")
+    links = set()
+    for it in (json.load(open(sched)) if os.path.exists(sched) else []):
+        at = datetime.datetime.fromisoformat(it["at"].replace("Z", "+00:00"))
+        if at <= now < at + datetime.timedelta(hours=6) and it["key"] not in posted:
+            out.append((it["key"], it["text"]))
+            if it.get("link"):
+                links.add(it["key"])
     for key, text in out:
         if live:
-            code, res = post_x(text)
+            code, res = post_x(text, allow_link=key in links)
             print(f"[{code}] {key} -> {res}")
             if code not in (200, 201):
                 continue
