@@ -111,9 +111,10 @@ def main(dry):
     # Sleeper asks that /players/nfl (5 MB) be fetched at most once a day: keep a slim copy in state,
     # and read live injury statuses from the much smaller weekly projections feed instead
     pmap = state.get("pmap")
-    if not pmap or state.get("pmap_day") != today:
+    if not pmap or state.get("pmap_day") != today or state.get("pmap_v") != 2:
         raw = fetch("https://api.sleeper.app/v1/players/nfl")
-        pmap = {pid: {"full_name": p.get("full_name") or f"{p.get('first_name') or ''} {p.get('last_name') or ''}".strip(), "position": p.get("position"), "team": p.get("team")}
+        pmap = {pid: {"full_name": p.get("full_name") or f"{p.get('first_name') or ''} {p.get('last_name') or ''}".strip(), "position": p.get("position"), "team": p.get("team"),
+                      "dcp": p.get("depth_chart_position"), "dco": p.get("depth_chart_order")}
                 for pid, p in raw.items() if p.get("position") in POS4 and p.get("team")}
     nfl = fetch("https://api.sleeper.app/v1/state/nfl")
     q = "&".join(f"position[]={x}" for x in POS4)
@@ -161,8 +162,18 @@ def main(dry):
         name, _, team = info(pid)
         if st in BAD and before in OK_BEFORE:
             body = p.get("injury_body_part")
+            # next on the depth chart at his spot (falls back to the teammate leagues are adding most)
+            me_d = pmap.get(pid, {})
+            depth = sorted((m for m, q in pmap.items() if q.get("team") == team and q.get("dcp") and q.get("dcp") == me_d.get("dcp") and m != pid and q.get("dco")
+                            and (players.get(m, {}).get("injury_status") not in BAD)), key=lambda m: pmap[m]["dco"])
             mates = sorted((m for m in adds24 if players.get(m, {}).get("team") == team and players.get(m, {}).get("position") == pos and m != pid), key=lambda m: -adds24[m])
-            nxt = f"\nNext man up on Sleeper waivers: {info(mates[0])[0]} ({adds24[mates[0]]:,} adds in 24h)" if mates else ""
+            if depth and (me_d.get("dco") or 9) <= 2:
+                b = depth[0]
+                nxt = f"\nNext man up: {info(b)[0]}" + (f" ({adds24[b]:,} adds on Sleeper in 24h)" if b in adds24 else "")
+            elif mates:
+                nxt = f"\nMost-added teammate on Sleeper: {info(mates[0])[0]} ({adds24[mates[0]]:,} adds in 24h)"
+            else:
+                nxt = ""
             text = (f"🚨 {name} ({pos}, {team}) {STATUS_TXT[st]}{f' ({body.lower()})' if body else ''}.\n\n"
                     f"Fantasy impact: {ctx_line(pid, pos)}{nxt}\n\nFull breakdown + trade values: link in bio")
             score = 1000 - min(red.get(pid, {}).get("prank", 99), dyn.get(pid, {}).get("prank", 99))
@@ -258,7 +269,7 @@ def main(dry):
 
     cutoff = now - datetime.timedelta(days=14)
     posted = {k: v for k, v in posted.items() if datetime.datetime.fromisoformat(v) > cutoff}
-    json.dump({"status": status_now, "posted": posted, "day": today, "daily": {"n": sent_today}, "pmap": pmap, "pmap_day": today,
+    json.dump({"status": status_now, "posted": posted, "day": today, "daily": {"n": sent_today}, "pmap": pmap, "pmap_day": today, "pmap_v": 2,
                "ranks": state["ranks"], "ranks_ts": state["ranks_ts"]}, open(STATE, "w"))
     verb = "posted" if live else "would post"
     print(f"checked {len(status_now)} players; {len(events)} candidate events; {len(out)} {verb}{' (first run: snapshot saved)' if not prev else ''}")
