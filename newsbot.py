@@ -74,7 +74,7 @@ def check_x():
         print("X credentials check failed:", e.code, e.read().decode()[:300])
 
 
-def post_x(text, allow_link=False):
+def post_x(text, allow_link=False, poll=None):
     import re
     if not allow_link and re.search(r"https?://|\b[\w-]+\.(app|com|io|net|org|ly|co)\b", text):
         return 0, "refused: post contains a link (~13x the API price)"
@@ -86,7 +86,7 @@ def post_x(text, allow_link=False):
     base = "&".join(["POST", q(url), q("&".join(f"{q(a)}={q(b)}" for a, b in sorted(oauth.items())))])
     oauth["oauth_signature"] = base64.b64encode(hmac.new(f"{q(ks)}&{q(ts)}".encode(), base.encode(), hashlib.sha1).digest()).decode()
     auth = "OAuth " + ", ".join(f'{q(a)}="{q(b)}"' for a, b in sorted(oauth.items()))
-    req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(), method="POST",
+    req = urllib.request.Request(url, data=json.dumps({"text": text, **({"poll": {"options": poll, "duration_minutes": 1440}} if poll else {})}).encode(), method="POST",
                                  headers={"Authorization": auth, "Content-Type": "application/json", "User-Agent": "LeagueLens-newsbot/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=60, context=CTX) as r:
@@ -97,7 +97,7 @@ def post_x(text, allow_link=False):
 
 def main(dry):
     live = not dry and all(os.environ.get(x) for x in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"))
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.fromisoformat(os.environ["NEWSBOT_NOW"]) if os.environ.get("NEWSBOT_NOW") else datetime.datetime.now(datetime.timezone.utc)  # NEWSBOT_NOW: test a given day
     today = now.date().isoformat()
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     seed = os.path.join(HERE, "posted-seed.json")
@@ -248,6 +248,59 @@ def main(dry):
         if len(outs) >= 3:
             events.append((1950, f"weekly:sunday:{wk}", "🚫 Out or doubtful today, fantasy-relevant:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in outs) + "\n\nCheck your lineups before kickoff."))
 
+    # polls (replies + reach) and the Tuesday awards; options must be 25 characters or fewer
+    polls = {}
+    short = lambda pid: (lambda n: n if len(n) <= 25 else n.split(" ")[-1][:25])(info(pid)[0])
+    if now.weekday() == 1 and now.hour >= 18:  # Tuesday: waiver poll
+        adds48 = fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=48&limit=40")
+        top = [t["player_id"] for t in adds48 if info(t["player_id"])[1] in POS4][:4]
+        if len(top) == 4:
+            key = f"poll:waivers:{wk}"; polls[key] = [short(x) for x in top]
+            events.append((1700, key, "🗳️ Your #1 waiver target this week?\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in top)))
+    if now.weekday() == 3 and now.hour >= 18:  # Thursday: buy/sell/hold on the biggest dynasty riser
+        mv = [(pid, x) for pid, x in dyn.items() if x["trend"] and x["v"] - x["trend"] > 0 and x["v"] >= 2000]
+        if mv:
+            pid, x = max(mv, key=lambda t: t[1]["trend"] / (t[1]["v"] - t[1]["trend"]))
+            pc = round(100 * x["trend"] / (x["v"] - x["trend"]))
+            if pc >= 10:
+                key = f"poll:buysell:{wk}"; polls[key] = ["Buy", "Sell", "Hold"]
+                events.append((1650, key, f"📈 {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]}) is up {pc}% in dynasty trade value over the last 30 days, now the {x['rank']}{'th' if 10 <= x['rank'] % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(x['rank'] % 10, 'th')} most valuable player in Superflex.\n\nBuy, sell or hold?"))
+    if now.weekday() == 4 and now.hour >= 16:  # Friday: the closest start/sit call among fringe starters
+        pts = {r["player_id"]: (r.get("stats") or {}).get("pts_ppr") or 0 for r in proj if r.get("player_id")}
+        best = None
+        for pos, lo, hi in (("WR", 14, 30), ("RB", 12, 26)):
+            ranked = [pid for pid in sorted((pid for pid in pts if pmap.get(pid, {}).get("position") == pos and players.get(pid, {}).get("injury_status") not in BAD), key=lambda q: -pts[q])][lo:hi]
+            for a, b in zip(ranked, ranked[1:]):
+                d = abs(pts[a] - pts[b])
+                if best is None or d < best[0]:
+                    best = (d, pos, a, b)
+        if best:
+            _, pos, a, b = best
+            key = f"poll:startsit:{wk}"; polls[key] = [short(a), short(b)]
+            events.append((1600, key, f"🤔 Week {nfl.get('week')} flex call ({pos}):\n\n{info(a)[0]} ({info(a)[2]}): {pts[a]:.1f} projected\n{info(b)[0]} ({info(b)[2]}): {pts[b]:.1f} projected\n\nThe projections can't split them. Who are you starting?"))
+    if now.weekday() == 1 and 13 <= now.hour < 20:  # Tuesday morning: last week's awards, from final stats
+        q2 = "&".join(f"position[]={x}" for x in POS4)
+        for w in (int(nfl.get("week") or 1), int(nfl.get("week") or 1) - 1):
+            st = fetch(f"https://api.sleeper.app/stats/nfl/{nfl.get('season')}/{w}?season_type=regular&{q2}") or []
+            act = {r["player_id"]: (r.get("stats") or {}).get("pts_ppr") or 0 for r in st if r.get("player_id") and (r.get("stats") or {}).get("gp")}
+            if len(act) >= 200:
+                break
+        else:
+            act = {}
+        if act:
+            pj = {r["player_id"]: (r.get("stats") or {}).get("pts_ppr") or 0 for r in (fetch(f"https://api.sleeper.app/projections/nfl/{nfl.get('season')}/{w}?season_type=regular&{q2}") or []) if r.get("player_id")}
+            tops = []
+            for pos in POS4:
+                c = [pid for pid in act if pmap.get(pid, {}).get("position") == pos]
+                if c:
+                    m = max(c, key=lambda q: act[q]); tops.append(f"{pos}: {info(m)[0]} ({act[m]:.1f})")
+            proj_top = [pid for pid in sorted(pj, key=lambda q: -pj[q]) if pid in act and pmap.get(pid, {}).get("position") in POS4][:40]
+            boom = max((pid for pid in act if pid in pj and pmap.get(pid, {}).get("position") in POS4), key=lambda q: act[q] - pj[q], default=None)
+            bust = min(proj_top, key=lambda q: act[q] - pj[q], default=None)
+            if len(tops) == 4 and boom and bust:
+                events.append((2100, f"weekly:awards:{wk}", f"🏆 Week {w} fantasy awards (PPR):\n\n" + "\n".join(tops)
+                               + f"\n\n💥 Boom: {info(boom)[0]}, {act[boom]:.1f} (projected {pj[boom]:.1f})\n🫥 Bust: {info(bust)[0]}, {act[bust]:.1f} (projected {pj[bust]:.1f})\n\nWho won your league's week?"))
+
     out = []
     for score, key, text in sorted(events, key=lambda e: -e[0]):
         if key in posted or len(out) >= PER_RUN or sent_today + len(out) >= PER_DAY:
@@ -267,12 +320,12 @@ def main(dry):
                 links.add(it["key"])
     for key, text in out:
         if live:
-            code, res = post_x(text, allow_link=key in links)
+            code, res = post_x(text, allow_link=key in links, poll=polls.get(key))
             print(f"[{code}] {key} -> {res}")
             if code not in (200, 201):
                 continue
         else:
-            print(f"--- DRY RUN ({key}) ---\n{text}\n")
+            print(f"--- DRY RUN ({key}) ---\n{text}\n" + (f"[poll] {polls[key]}\n" if key in polls else ""))
         posted[key] = now.isoformat()
     sent_today += len(out) if not live else sum(1 for k, _ in out if k in posted)
 
