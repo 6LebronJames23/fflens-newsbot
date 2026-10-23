@@ -19,9 +19,9 @@ POS4 = ["QB", "RB", "WR", "TE"]
 BAD = {"Out", "IR", "Doubtful", "PUP", "Sus"}
 OK_BEFORE = {None, "", "Questionable", "Probable"}
 # fantasy-relevant = inside these position ranks (redraft) or the dynasty Superflex top 150
-REL = {"QB": 28, "RB": 60, "WR": 72, "TE": 24}
-STAR = {"QB": 8, "RB": 12, "WR": 12, "TE": 8}  # stars: even a Questionable tag is news
-PER_RUN, PER_DAY = 3, 15
+REL = {"QB": 32, "RB": 70, "WR": 84, "TE": 28}
+STAR = {"QB": 10, "RB": 16, "WR": 16, "TE": 10}  # stars: even a Questionable tag is news
+PER_RUN, PER_DAY = 4, 24
 STATUS_TXT = {"Out": "ruled OUT", "IR": "placed on IR", "Doubtful": "listed as DOUBTFUL", "PUP": "placed on PUP", "Sus": "suspended"}
 CTX = ssl.create_default_context(cafile="/etc/ssl/cert.pem") if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem") else None
 
@@ -113,9 +113,21 @@ def main(dry):
     pmap = state.get("pmap")
     if not pmap or state.get("pmap_day") != today or state.get("pmap_v") != 2:
         raw = fetch("https://api.sleeper.app/v1/players/nfl")
+        old_pmap = pmap or {}
         pmap = {pid: {"full_name": p.get("full_name") or f"{p.get('first_name') or ''} {p.get('last_name') or ''}".strip(), "position": p.get("position"), "team": p.get("team"),
                       "dcp": p.get("depth_chart_position"), "dco": p.get("depth_chart_order")}
                 for pid, p in raw.items() if p.get("position") in POS4 and p.get("team")}
+        # day-over-day roster news from the full player list: team changes (trades, releases, signings) and new starters
+        changes = []
+        for pid, o in old_pmap.items():
+            n = raw.get(pid) or {}
+            if o.get("team") and n.get("team") != o.get("team") and n.get("position") in POS4:
+                changes.append({"t": "move", "pid": pid, "name": o["full_name"], "pos": o["position"], "from": o["team"], "to": n.get("team")})
+        for pid, q in pmap.items():
+            o = old_pmap.get(pid)
+            if o and q["position"] in ("QB", "RB", "TE") and o.get("team") == q["team"] and o.get("dcp") == q.get("dcp") and q.get("dco") == 1 and (o.get("dco") or 9) > 1:
+                changes.append({"t": "starter", "pid": pid, "pos": q["position"], "team": q["team"], "was": o.get("dco")})
+        state["changes"], state["changes_day"] = changes, today
     nfl = fetch("https://api.sleeper.app/v1/state/nfl")
     q = "&".join(f"position[]={x}" for x in POS4)
     proj = fetch(f"https://api.sleeper.app/projections/nfl/{nfl.get('season')}/{max(1, int(nfl.get('week') or 1))}?season_type=regular&{q}") or []
@@ -183,15 +195,28 @@ def main(dry):
             text = (f"⚠️ {name} ({pos}, {team}) is QUESTIONABLE{f' ({body.lower()})' if body else ''}.\n\n"
                     f"Fantasy impact: {ctx_line(pid, pos)}. Have a backup plan before lock.")
             events.append((800 - red[pid]["prank"], f"q:{pid}:{today}", text))
-        elif before in BAD and st in (None, "") and (red.get(pid, {}).get("prank", 99) <= REL[pos] // 2):
+        elif before in BAD and st in (None, "") and (red.get(pid, {}).get("prank", 99) <= REL[pos]):
             text = f"✅ {name} ({pos}, {team}) no longer carries an injury designation on Sleeper.\n\n{ctx_line(pid, pos)}. Back in lineups?"
             events.append((500 - red[pid]["prank"], f"back:{pid}:{today}", text))
+
+    # roster news found in today's player-list refresh
+    for c in (state.get("changes") or []) if state.get("changes_day") == today else []:
+        pid, pos = c["pid"], c["pos"]
+        if not relevant(pid, pos):
+            continue
+        score = 900 - min(red.get(pid, {}).get("prank", 99), dyn.get(pid, {}).get("prank", 99))
+        if c["t"] == "move":
+            what = f"is now with {c['to']} (from {c['from']})" if c.get("to") else f"has been released by {c['from']}"
+            events.append((score, f"move:{pid}:{c.get('to') or 'FA'}", f"🔁 {c['name']} ({pos}) {what}.\n\nFantasy impact: {ctx_line(pid, pos)}. New role, new value: check your trade offers."))
+        elif c["t"] == "starter":
+            name = info(pid)[0]
+            events.append((score - 50, f"starter:{pid}:{c['team']}", f"📈 {name} is now listed as the {pos}1 on {c['team']}'s depth chart (was {pos}{c['was']}).\n\n{ctx_line(pid, pos)}{f' · {adds24[pid]:,} Sleeper adds in 24h' if pid in adds24 else ''}. Bigger role this week."))
 
     # waiver spikes: top of the 6-hour adds list
     for i, t in enumerate(adds6[:3]):
         pid, n = t["player_id"], t["count"]
         name, pos, team = info(pid)
-        if pos not in POS4 or n < 15000:
+        if pos not in POS4 or n < 10000:
             continue
         key = f"spike:{pid}"
         last = posted.get(key)
@@ -332,7 +357,7 @@ def main(dry):
     cutoff = now - datetime.timedelta(days=14)
     posted = {k: v for k, v in posted.items() if datetime.datetime.fromisoformat(v) > cutoff}
     json.dump({"status": status_now, "posted": posted, "day": today, "daily": {"n": sent_today}, "pmap": pmap, "pmap_day": today, "pmap_v": 2,
-               "ranks": state["ranks"], "ranks_ts": state["ranks_ts"]}, open(STATE, "w"))
+               "ranks": state["ranks"], "ranks_ts": state["ranks_ts"], "changes": state.get("changes"), "changes_day": state.get("changes_day")}, open(STATE, "w"))
     verb = "posted" if live else "would post"
     print(f"checked {len(status_now)} players; {len(events)} candidate events; {len(out)} {verb}{' (first run: snapshot saved)' if not prev else ''}")
 
