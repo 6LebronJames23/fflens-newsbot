@@ -443,6 +443,16 @@ def main(dry):
                                dict(title=f"Week {w} fantasy awards", subtitle="PPR points", rows=[(f"Top {t.split(':')[0]}: {t.split(': ', 1)[1].rsplit(' (', 1)[0]}", t.rsplit("(", 1)[1].rstrip(")"), "good") for t in tops]
                                     + [(f"Boom: {info(boom)[0]} (proj {pj[boom]:.1f})", f"{act[boom]:.1f}", "good"), (f"Bust: {info(bust)[0]} (proj {pj[bust]:.1f})", f"{act[bust]:.1f}", "bad")])))
 
+    rkey = f"weekly:race:{wk}"
+    if et.weekday() == 6 and peak and rkey not in posted and (live or os.environ.get("NEWSBOT_REPLY_DRY")):  # Sunday: one real league's playoff race
+        try:
+            import replies
+            r = replies.race(state.setdefault("rep", {}), now)
+            if r:
+                events.append((2050, rkey, r[1], r[0]))
+        except Exception as e:
+            print("race post failed:", repr(e)[:300])
+
     out = []
     for score, key, text, *spec in sorted(events, key=lambda e: -e[0]):
         if key in posted or len(out) >= PER_RUN or sent_today + len(out) >= PER_DAY:
@@ -463,7 +473,7 @@ def main(dry):
             if it.get("link"):
                 links.add(it["key"])
     for key, text, spec in out:
-        png = make_card(spec) if spec and key not in polls else None  # X doesn't allow a poll and an image together
+        png = spec if isinstance(spec, bytes) else make_card(spec) if spec and key not in polls else None  # X doesn't allow a poll and an image together
         if live:
             media = upload_media(png) if png else None
             code, res = post_x(text, allow_link=key in links, poll=polls.get(key), media=media)
@@ -482,7 +492,7 @@ def main(dry):
 
     # answer "what are my playoff odds?" replies under the pinned post
     pin = os.environ.get("PIN_TWEET_ID") or state.get("pin")
-    rep = state.get("rep") or {}
+    rep = state.setdefault("rep", {})
     if pin and (live or os.environ.get("NEWSBOT_REPLY_DRY")):
         try:
             import replies

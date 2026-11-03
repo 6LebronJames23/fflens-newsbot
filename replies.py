@@ -65,8 +65,9 @@ def find_team(text, known=None):
                   if names else "Reply with your Sleeper username and I'll run your league's playoff odds.")
 
 
-def render(lid, rid):
-    """-> (png bytes, summary text) from fflens.app's own Playoff Odds page, or (None, reason)"""
+def render(lid, rid, btn="#shScen"):
+    """-> (png bytes, share text) from fflens.app's own Playoff Odds page, or (None, reason).
+    btn: "#shScen" = one team's playoff picture, "#shRace" = the whole league's race"""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         try:
@@ -80,15 +81,15 @@ def render(lid, rid):
             pg.evaluate("""([lid, rid]) => { localStorage.setItem('ll_myteam', JSON.stringify({[lid]: rid})); for (const k of ['ll_rp_off', 'll_tour', 'll_who_off']) localStorage.setItem(k, '1'); }""", [lid, rid])
             pg.goto(f"{SITE}/#/l/{lid}/playoffs", wait_until="domcontentloaded")
             try:
-                pg.wait_for_selector("#shScen", timeout=120000)
+                pg.wait_for_selector(btn, timeout=120000)
             except Exception:
                 txt = pg.inner_text("#panel") if pg.query_selector("#panel") else ""
                 return None, "playoffs over" if "Final Standings" in txt else "no scenarios"
             pg.evaluate("""() => { window.__img = null; shDeliver = async (c, f, t, text) => { window.__img = c.toDataURL('image/png'); window.__txt = text; return 'shared'; }; }""")
-            pg.click("#shScen")
+            pg.click(btn)
             pg.wait_for_function("() => window.__img", timeout=60000)
             img, txt = pg.evaluate("() => [window.__img, window.__txt]")
-            return base64.b64decode(img.split(",", 1)[1]), txt.split("\n")[0]
+            return base64.b64decode(img.split(",", 1)[1]), txt
         finally:
             b.close()
 
@@ -124,6 +125,7 @@ def run(rep, pin, me_id, live, now, x):
         if team:
             try:
                 png, summary = render(team["lid"], team["rid"])
+                summary = summary.split("\n")[0]
             except Exception as e:
                 print("reply render failed:", repr(e)[:200]); done.pop(t["id"], None); continue
             if not png:
@@ -142,6 +144,8 @@ def run(rep, pin, me_id, live, now, x):
                 continue
         else:
             print(f"--- DRY REPLY to {t['id']} ---\n{text}\n" + ("[image]\n" if png else ""))
+        if team and png:
+            rep.setdefault("leagues", {})[team["lid"]] = [team["league"], team["rid"], day]  # candidates for the Sunday race post
         rep["users"][a] = rep["users"].get(a, 0) + 1
         rep["n"] += 1
         sent += 1
@@ -149,6 +153,30 @@ def run(rep, pin, me_id, live, now, x):
         rep["who"] = dict(list(rep["who"].items())[-2000:])
     if len(done) > 3000:
         rep["done"] = dict(list(done.items())[-2000:])
+
+
+DEFAULT_RACE = ("1327872832864022528", None)  # fallback league for the Sunday race post when nobody has asked yet
+
+
+def race(rep, now):
+    """Sunday post: one real league's playoff race (a league someone asked about this week, else the default) -> (png, text) or None"""
+    day = now.date()
+    recent = sorted(((v[2], lid, v[1]) for lid, v in (rep.get("leagues") or {}).items()
+                     if (day - __import__("datetime").date.fromisoformat(v[2])).days <= 7 and lid not in (rep.get("raced") or [])), reverse=True)
+    for _, lid, rid in recent + [(None,) + DEFAULT_RACE]:
+        png, txt = render(lid, rid, "#shRace")
+        if not png:
+            continue
+        rep.setdefault("raced", []).append(lid); rep["raced"] = rep["raced"][-30:]
+        lines = [l for l in txt.split("\n") if l and "http" not in l]
+        name = lines[0].split(": playoff race")[0]
+        body = sorted(lines[1:], key=lambda l: not l.startswith("🫧"))  # the bubble is the story; other lines go first if it's too long
+        while True:  # trim the summary rather than cut the reply ask (emoji count double on X, hence the margin)
+            text = f"🏈 Sunday playoff race check: {name}, one real Sleeper league.\n\n" + "\n".join(body) + "\n\nReply with your Sleeper username and I'll send your league's playoff picture."
+            if len(text) <= 268 or not body:
+                return png, text[:268]
+            body = body[:-1] if len(body) > 1 else ([body[0].rsplit(", ", 1)[0]] if ", " in body[0] else [])
+    return None
 
 
 if __name__ == "__main__":
