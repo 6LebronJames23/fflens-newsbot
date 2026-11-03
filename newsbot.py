@@ -109,7 +109,29 @@ def make_card(spec):
         return None
 
 
-def post_x(text, allow_link=False, poll=None, media=None):
+def x_get(url, params):
+    """signed GET on the X API -> parsed JSON, or None"""
+    req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote),
+                                 headers={"Authorization": oauth_header("GET", url, params), "User-Agent": "LeagueLens-newsbot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=CTX) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print("X read failed:", e.code, e.read().decode()[:300])
+    except Exception as e:
+        print("X read failed:", repr(e)[:200])
+    return None
+
+
+def search_recent(query, since=None):
+    p = {"query": query, "max_results": "25", "tweet.fields": "author_id,conversation_id"}
+    if since:
+        p["since_id"] = since
+    d = x_get("https://api.x.com/2/tweets/search/recent", p)
+    return None if d is None else d.get("data") or []
+
+
+def post_x(text, allow_link=False, poll=None, media=None, reply_to=None):
     import re
     if not allow_link and re.search(r"https?://|\b[\w-]+\.(app|com|io|net|org|ly|co)\b", text):
         return 0, "refused: post contains a link (~13x the API price)"
@@ -122,6 +144,8 @@ def post_x(text, allow_link=False, poll=None, media=None):
     oauth["oauth_signature"] = base64.b64encode(hmac.new(f"{q(ks)}&{q(ts)}".encode(), base.encode(), hashlib.sha1).digest()).decode()
     auth = "OAuth " + ", ".join(f'{q(a)}="{q(b)}"' for a, b in sorted(oauth.items()))
     extra = {"poll": {"options": poll, "duration_minutes": 1440}} if poll else {"media": {"media_ids": [media]}} if media else {}
+    if reply_to:
+        extra["reply"] = {"in_reply_to_tweet_id": reply_to}
     req = urllib.request.Request(url, data=json.dumps({"text": text, **extra}).encode(), method="POST",
                                  headers={"Authorization": auth, "Content-Type": "application/json", "User-Agent": "LeagueLens-newsbot/1.0"})
     try:
@@ -446,6 +470,8 @@ def main(dry):
             print(f"[{code}] {key} -> {res}{' (with image)' if media else ''}")
             if code not in (200, 201):
                 continue
+            if key.startswith("pin-"):
+                state["pin"] = res  # replies under this post get answered automatically (replies.py)
         else:
             print(f"--- DRY RUN ({key}) ---\n{text}\n" + (f"[poll] {polls[key]}\n" if key in polls else "") + ("[image]\n" if png else ""))
             if png:
@@ -454,10 +480,23 @@ def main(dry):
         posted[key] = now.isoformat()
     sent_today += len(out) if not live else sum(1 for k, *_ in out if k in posted)
 
+    # answer "what are my playoff odds?" replies under the pinned post
+    pin = os.environ.get("PIN_TWEET_ID") or state.get("pin")
+    rep = state.get("rep") or {}
+    if pin and (live or os.environ.get("NEWSBOT_REPLY_DRY")):
+        try:
+            import replies
+            if live and not state.get("me_id"):
+                state["me_id"] = (x_get("https://api.x.com/2/users/me", {}) or {}).get("data", {}).get("id")
+            replies.run(rep, pin, state.get("me_id"), live, now, {"search": search_recent, "upload": upload_media, "post": post_x})
+        except Exception as e:
+            print("replies failed:", repr(e)[:300])
+
     cutoff = now - datetime.timedelta(days=14)
     posted = {k: v for k, v in posted.items() if datetime.datetime.fromisoformat(v) > cutoff}
     json.dump({"status": status_now, "posted": posted, "day": today, "daily": {"n": sent_today}, "pmap": pmap, "pmap_day": today, "pmap_v": 2,
-               "ranks": state["ranks"], "ranks_ts": state["ranks_ts"], "changes": state.get("changes"), "changes_day": state.get("changes_day")}, open(STATE, "w"))
+               "ranks": state["ranks"], "ranks_ts": state["ranks_ts"], "changes": state.get("changes"), "changes_day": state.get("changes_day"),
+               "pin": state.get("pin"), "rep": rep, "me_id": state.get("me_id")}, open(STATE, "w"))
     verb = "posted" if live else "would post"
     print(f"checked {len(status_now)} players; {len(events)} candidate events; {len(out)} {verb}{' (first run: snapshot saved)' if not prev else ''}")
 

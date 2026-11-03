@@ -9,7 +9,7 @@
   "key": "pin-playoff-odds-2026-11",
   "at": "2026-11-04T00:30:00Z",
   "link": true,
-  "text": "🏈 Playoff race check.\n\nReply with your Sleeper username (or ESPN league link) and I'll reply with your real playoff odds: where you stand now, if you win or lose this week, and exactly who to root for.\n\nOr check it yourself, free, no login:\nhttps://fflens.app",
+  "text": "🏈 Playoff race check.\n\nReply with your Sleeper username and I'll reply with your real playoff odds: where you stand now, if you win or lose this week, and who to root for.\n\nOr check it yourself, free, no login:\nhttps://fflens.app",
   "card": {
    "title": "Your playoff odds?",
    "subtitle": "Reply with your Sleeper username and I'll run your league",
