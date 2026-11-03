@@ -4,5 +4,39 @@
   "at": "2026-10-15T07:05:00Z",
   "text": "League Lens is live on Product Hunt today 🚀\n\nFree fantasy football analyzer for Sleeper & ESPN: power rankings, playoff odds, a Trade Finder for trades both teams win, and weekly recaps for your league chat.\n\nNo login, no ads.\n\nhttps://www.producthunt.com/products/league-lens",
   "link": true
+ },
+ {
+  "key": "pin-playoff-odds-2026-11",
+  "at": "2026-11-04T00:30:00Z",
+  "link": true,
+  "text": "🏈 Playoff race check.\n\nReply with your Sleeper username (or ESPN league link) and I'll reply with your real playoff odds: where you stand now, if you win or lose this week, and exactly who to root for.\n\nOr check it yourself, free, no login:\nhttps://fflens.app",
+  "card": {
+   "title": "Your playoff odds?",
+   "subtitle": "Reply with your Sleeper username and I'll run your league",
+   "badge": "ON THE BUBBLE?",
+   "badge_color": "warn",
+   "rows": [
+    [
+     "Your odds right now",
+     "53%"
+    ],
+    [
+     "If you win this week",
+     "75%",
+     "good"
+    ],
+    [
+     "If you lose",
+     "45%",
+     "bad"
+    ],
+    [
+     "Games to root for",
+     "3 this week",
+     "warn"
+    ]
+   ],
+   "note": "6,000 simulated seasons · free, no login"
+  }
  }
 ]

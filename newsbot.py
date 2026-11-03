@@ -8,9 +8,13 @@ Without X credentials it only prints what it would post (dry run).
 Posts carry NO links on purpose: on X's pay-per-use API a post with a URL costs ~$0.20 vs ~$0.015 without (2026). Credentials (OAuth 1.0a, user context
 of @fflensapp): X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET.
 
-Local dry run:  python3 newsbot.py --dry
+Most posts carry an image card (card.py, Pillow) uploaded through X's media endpoint; if the upload fails the post goes out as text.
+Weekly roundups, polls and takes wait for peak hours (ET lunch, evening, Sunday morning); breaking news posts right away.
+
+Local dry run:  python3 newsbot.py --dry   (writes each post's card to dry-cards/)
 """
-import base64, datetime, hashlib, hmac, json, os, ssl, sys, time, urllib.parse, urllib.request, uuid
+import base64, datetime, hashlib, hmac, json, os, random, ssl, sys, time, urllib.parse, urllib.request, uuid
+from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "newsbot-state.json")
@@ -21,7 +25,9 @@ OK_BEFORE = {None, "", "Questionable", "Probable"}
 # fantasy-relevant = inside these position ranks (redraft) or the dynasty Superflex top 150
 REL = {"QB": 32, "RB": 70, "WR": 84, "TE": 28}
 STAR = {"QB": 10, "RB": 16, "WR": 16, "TE": 10}  # stars: even a Questionable tag is news
-PER_RUN, PER_DAY = 4, 24
+# OUT/IR/roster-move posts only for players people actually start (or dynasty top 75): fewer, better posts
+STARTER = {"QB": 18, "RB": 32, "WR": 36, "TE": 12}
+PER_RUN, PER_DAY = 4, 12
 STATUS_TXT = {"Out": "ruled OUT", "IR": "placed on IR", "Doubtful": "listed as DOUBTFUL", "PUP": "placed on PUP", "Sus": "suspended"}
 CTX = ssl.create_default_context(cafile="/etc/ssl/cert.pem") if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem") else None
 
@@ -74,7 +80,36 @@ def check_x():
         print("X credentials check failed:", e.code, e.read().decode()[:300])
 
 
-def post_x(text, allow_link=False, poll=None):
+def upload_media(png):
+    """PNG bytes -> media id (X API v2 simple upload, multipart; OAuth 1.0a signs only the oauth params), or None."""
+    url = "https://api.x.com/2/media/upload"
+    b = uuid.uuid4().hex
+    body = (f'--{b}\r\nContent-Disposition: form-data; name="media_category"\r\n\r\ntweet_image\r\n'
+            f'--{b}\r\nContent-Disposition: form-data; name="media_type"\r\n\r\nimage/png\r\n'
+            f'--{b}\r\nContent-Disposition: form-data; name="media"; filename="card.png"\r\nContent-Type: image/png\r\n\r\n').encode() + png + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={"Authorization": oauth_header("POST", url), "Content-Type": f"multipart/form-data; boundary={b}",
+                                                                         "User-Agent": "LeagueLens-newsbot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=90, context=CTX) as r:
+            d = json.loads(r.read().decode())
+            return (d.get("data") or {}).get("id") or d.get("media_id_string")
+    except urllib.error.HTTPError as e:
+        print("media upload failed:", e.code, e.read().decode()[:300])
+    except Exception as e:
+        print("media upload failed:", repr(e)[:200])
+    return None
+
+
+def make_card(spec):
+    try:
+        import card
+        return card.render(**spec)
+    except Exception as e:
+        print("card render failed:", repr(e)[:200])
+        return None
+
+
+def post_x(text, allow_link=False, poll=None, media=None):
     import re
     if not allow_link and re.search(r"https?://|\b[\w-]+\.(app|com|io|net|org|ly|co)\b", text):
         return 0, "refused: post contains a link (~13x the API price)"
@@ -86,7 +121,8 @@ def post_x(text, allow_link=False, poll=None):
     base = "&".join(["POST", q(url), q("&".join(f"{q(a)}={q(b)}" for a, b in sorted(oauth.items())))])
     oauth["oauth_signature"] = base64.b64encode(hmac.new(f"{q(ks)}&{q(ts)}".encode(), base.encode(), hashlib.sha1).digest()).decode()
     auth = "OAuth " + ", ".join(f'{q(a)}="{q(b)}"' for a, b in sorted(oauth.items()))
-    req = urllib.request.Request(url, data=json.dumps({"text": text, **({"poll": {"options": poll, "duration_minutes": 1440}} if poll else {})}).encode(), method="POST",
+    extra = {"poll": {"options": poll, "duration_minutes": 1440}} if poll else {"media": {"media_ids": [media]}} if media else {}
+    req = urllib.request.Request(url, data=json.dumps({"text": text, **extra}).encode(), method="POST",
                                  headers={"Authorization": auth, "Content-Type": "application/json", "User-Agent": "LeagueLens-newsbot/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=60, context=CTX) as r:
@@ -138,6 +174,10 @@ def main(dry):
         state["ranks"], state["ranks_ts"] = {"red": ranks(False), "dyn": ranks(True)}, now.timestamp()
     red, dyn = state["ranks"]["red"], state["ranks"]["dyn"]
     relevant = lambda pid, pos: (pid in red and red[pid]["prank"] <= REL.get(pos, 0)) or (pid in dyn and dyn[pid]["rank"] <= 200)
+    starter = lambda pid, pos: (pid in red and red[pid]["prank"] <= STARTER.get(pos, 0)) or (pid in dyn and dyn[pid]["rank"] <= 75)
+    et = now.astimezone(ZoneInfo("America/New_York"))
+    # when fantasy X is busiest (ET): lunch and evening on weekdays/Saturday, Sunday morning before kickoff
+    peak = (10 <= et.hour < 13) if et.weekday() == 6 else (12 <= et.hour < 14 or 19 <= et.hour < 22)
     adds24 = {t["player_id"]: t["count"] for t in fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=200")}
     adds6 = fetch("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=6&limit=25")
 
@@ -172,37 +212,41 @@ def main(dry):
         if before == "__new__" or before == st:
             continue
         name, _, team = info(pid)
-        if st in BAD and before in OK_BEFORE:
+        if st in BAD and before in OK_BEFORE and starter(pid, pos):
             body = p.get("injury_body_part")
             # next on the depth chart at his spot (falls back to the teammate leagues are adding most)
             me_d = pmap.get(pid, {})
             depth = sorted((m for m, q in pmap.items() if q.get("team") == team and q.get("dcp") and q.get("dcp") == me_d.get("dcp") and m != pid and q.get("dco")
                             and (players.get(m, {}).get("injury_status") not in BAD)), key=lambda m: pmap[m]["dco"])
             mates = sorted((m for m in adds24 if players.get(m, {}).get("team") == team and players.get(m, {}).get("position") == pos and m != pid), key=lambda m: -adds24[m])
+            rows = [(lbl, f"{pos}{x[pid]['prank']}") for lbl, x in (("Rest of season", red), ("Dynasty Superflex", dyn)) if pid in x]
             if depth and (me_d.get("dco") or 9) <= 2:
                 b = depth[0]
                 nxt = f"\nNext man up: {info(b)[0]}" + (f" ({adds24[b]:,} adds on Sleeper in 24h)" if b in adds24 else "")
+                rows += [("Next man up", info(b)[0], "good")] + ([("His Sleeper adds, last 24h", f"{adds24[b]:,}", "good")] if b in adds24 else [])
             elif mates:
                 nxt = f"\nMost-added teammate on Sleeper: {info(mates[0])[0]} ({adds24[mates[0]]:,} adds in 24h)"
+                rows += [("Most-added teammate", info(mates[0])[0], "good"), ("Sleeper adds, last 24h", f"{adds24[mates[0]]:,}", "good")]
             else:
                 nxt = ""
             text = (f"🚨 {name} ({pos}, {team}) {STATUS_TXT[st]}{f' ({body.lower()})' if body else ''}.\n\n"
                     f"Fantasy impact: {ctx_line(pid, pos)}{nxt}\n\nFull breakdown + trade values: link in bio")
             score = 1000 - min(red.get(pid, {}).get("prank", 99), dyn.get(pid, {}).get("prank", 99))
-            events.append((score, f"inj:{pid}:{st}:{today}", text))
+            events.append((score, f"inj:{pid}:{st}:{today}", text, dict(title=name, subtitle=" · ".join(x for x in (pos, team, body) if x), badge={"Out": "OUT", "IR": "IR", "Doubtful": "DOUBTFUL", "PUP": "PUP", "Sus": "SUSPENDED"}[st], rows=rows)))
         elif st == "Questionable" and before in (None, "") and red.get(pid, {}).get("prank", 99) <= STAR[pos]:
             body = p.get("injury_body_part")
             text = (f"⚠️ {name} ({pos}, {team}) is QUESTIONABLE{f' ({body.lower()})' if body else ''}.\n\n"
                     f"Fantasy impact: {ctx_line(pid, pos)}. Have a backup plan before lock.")
-            events.append((800 - red[pid]["prank"], f"q:{pid}:{today}", text))
-        elif before in BAD and st in (None, "") and (red.get(pid, {}).get("prank", 99) <= REL[pos]):
+            events.append((800 - red[pid]["prank"], f"q:{pid}:{today}", text, dict(title=name, subtitle=" · ".join(x for x in (pos, team, body) if x), badge="QUESTIONABLE", badge_color="warn",
+                           rows=[(lbl, f"{pos}{x[pid]['prank']}") for lbl, x in (("Rest of season", red), ("Dynasty Superflex", dyn)) if pid in x] + [("Have a backup ready", "before lock", "warn")])))
+        elif before in BAD and st in (None, "") and (red.get(pid, {}).get("prank", 99) <= STAR[pos]):
             text = f"✅ {name} ({pos}, {team}) no longer carries an injury designation on Sleeper.\n\n{ctx_line(pid, pos)}. Back in lineups?"
             events.append((500 - red[pid]["prank"], f"back:{pid}:{today}", text))
 
     # roster news found in today's player-list refresh
     for c in (state.get("changes") or []) if state.get("changes_day") == today else []:
         pid, pos = c["pid"], c["pos"]
-        if not relevant(pid, pos):
+        if not starter(pid, pos):
             continue
         score = 900 - min(red.get(pid, {}).get("prank", 99), dyn.get(pid, {}).get("prank", 99))
         if c["t"] == "move":
@@ -229,7 +273,9 @@ def main(dry):
                 break
         text = (f"📈 {name} ({pos}, {team}) is the {['most', 'second-most', 'third-most'][i]}-added player on Sleeper right now: {n:,} adds in the last 6 hours{why}.\n\n"
                 f"Top adds + FAAB help for your league: link in bio")
-        events.append((300 - i, key, text))
+        events.append((300 - i, key, text, dict(title=name, subtitle=f"{pos} · {team}" + (f" · {why.strip()}" if why else ""), badge="WAIVER SPIKE", badge_color="good",
+                       rows=[("Sleeper adds, last 6 hours", f"{n:,}", "good"), *(([("Last 24 hours", f"{adds24[pid]:,}", "good")]) if pid in adds24 else []),
+                             (f"Rank among adds right now", f"#{i + 1}")])))
 
     # weekly roundups (once per ISO week): Tuesday = top waiver adds, Thursday = dynasty market movers
     wk = "%d-%02d" % now.isocalendar()[:2]
@@ -238,7 +284,8 @@ def main(dry):
         top = [(t["player_id"], t["count"]) for t in adds48 if info(t["player_id"])[1] in POS4][:5]
         if len(top) == 5:
             lines = [f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]}): {n:,} adds" for i, (pid, n) in enumerate(top)]
-            events.append((2000, f"weekly:waivers:{wk}", "🧾 Top waiver adds across Sleeper leagues this week:\n\n" + "\n".join(lines) + "\n\nWho are you spending FAAB on? Bid help for your league: link in bio"))
+            events.append((2000, f"weekly:waivers:{wk}", "🧾 Top waiver adds across Sleeper leagues this week:\n\n" + "\n".join(lines) + "\n\nWho are you spending FAAB on? Bid help for your league: link in bio",
+                           dict(title="Top waiver adds this week", subtitle="Across Sleeper leagues, last 48 hours", rows=[(f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]})", f"{n:,}", "good") for i, (pid, n) in enumerate(top)])))
     if now.weekday() == 3 and now.hour >= 15:
         mv = [(pid, x) for pid, x in dyn.items() if x["trend"] and x["v"] - x["trend"] > 0 and x["v"] >= 1500]
         pct = lambda x: round(100 * x["trend"] / (x["v"] - x["trend"]))
@@ -247,31 +294,40 @@ def main(dry):
         if len(up) == 3 and len(dn) == 3 and up[0][1]["trend"] > 0 and dn[0][1]["trend"] < 0:
             fmt = lambda t: f"{info(t[0])[0]} ({info(t[0])[1]}) {'+' if t[1]['trend'] > 0 else ''}{pct(t[1])}%"
             events.append((1900, f"weekly:movers:{wk}", "📈 Dynasty market risers, last 30 days (Superflex):\n" + "\n".join("▲ " + fmt(t) for t in up)
-                           + "\n\n📉 Fallers:\n" + "\n".join("▼ " + fmt(t) for t in dn) + "\n\nBuy low or sell high? Full list: link in bio"))
+                           + "\n\n📉 Fallers:\n" + "\n".join("▼ " + fmt(t) for t in dn) + "\n\nBuy low or sell high? Full list: link in bio",
+                           dict(title="Dynasty risers & fallers", subtitle="Trade value change, last 30 days (Superflex)",
+                                rows=[(f"{info(t[0])[0]} ({info(t[0])[1]})", f"{'+' if t[1]['trend'] > 0 else ''}{pct(t[1])}%", "good" if t[1]["trend"] > 0 else "bad") for t in up + dn])))
 
     if now.weekday() == 0 and now.hour >= 15:  # Monday: who's getting cut
         drops = fetch("https://api.sleeper.app/v1/players/nfl/trending/drop?lookback_hours=24&limit=40")
         top = [(t["player_id"], t["count"]) for t in drops if info(t["player_id"])[1] in POS4][:5]
         if len(top) == 5:
             events.append((1850, f"weekly:drops:{wk}", "✂️ Most-dropped players across Sleeper leagues in the last 24 hours:\n\n"
-                           + "\n".join(f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]}): {n:,} drops" for i, (pid, n) in enumerate(top)) + "\n\nCut too early, or right call?"))
+                           + "\n".join(f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]}): {n:,} drops" for i, (pid, n) in enumerate(top)) + "\n\nCut too early, or right call?",
+                           dict(title="Most-dropped players", subtitle="Across Sleeper leagues, last 24 hours", rows=[(f"{i + 1}. {info(pid)[0]} ({info(pid)[1]}, {info(pid)[2]})", f"{n:,}", "bad") for i, (pid, n) in enumerate(top)])))
     if now.weekday() == 2 and now.hour >= 15:  # Wednesday: top projected at each position
         pts = {r["player_id"]: (r.get("stats") or {}).get("pts_ppr") or 0 for r in proj if r.get("player_id")}
-        lines = []
+        lines, crows = [], []
         for pos in POS4:
             best = sorted((pid for pid in pts if pid in pmap and pmap[pid]["position"] == pos), key=lambda x: -pts[x])[:3]
             if best:
                 lines.append(f"{pos}: " + ", ".join(f"{info(x)[0]} ({pts[x]:.1f})" for x in best))
+                crows.append((f"{pos}1: {info(best[0])[0]} ({info(best[0])[2]})", f"{pts[best[0]]:.1f}", "good"))
         if len(lines) == 4:
-            events.append((1800, f"weekly:proj:{wk}", f"📊 Top projected players for week {nfl.get('week')} (PPR):\n\n" + "\n".join(lines) + "\n\nStart/sit for your own lineup: link in bio"))
+            events.append((1800, f"weekly:proj:{wk}", f"📊 Top projected players for week {nfl.get('week')} (PPR):\n\n" + "\n".join(lines) + "\n\nStart/sit for your own lineup: link in bio",
+                           dict(title=f"Week {nfl.get('week')} top projected", subtitle="Highest PPR projection at each position", rows=crows)))
     if now.weekday() == 4 and now.hour >= 18:  # Friday: questionable stars heading into the weekend
         qs = sorted((pid for pid, p in players.items() if p.get("injury_status") == "Questionable" and pid in red and red[pid]["prank"] <= STAR.get(p["position"], 0)), key=lambda x: red[x]["rank"])[:6]
         if len(qs) >= 3:
-            events.append((1800, f"weekly:questionable:{wk}", "⚠️ Questionable heading into the weekend:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in qs) + "\n\nWho are you benching?"))
+            events.append((1800, f"weekly:questionable:{wk}", "⚠️ Questionable heading into the weekend:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in qs) + "\n\nWho are you benching?",
+                           dict(title="Questionable this weekend", subtitle="Fantasy starters with a game-time decision", badge="Q", badge_color="warn",
+                                rows=[(f"{info(x)[0]} ({info(x)[2]})", f"{info(x)[1]}{red[x]['prank']}", "warn") for x in qs])))
     if now.weekday() == 6 and 15 <= now.hour < 17:  # Sunday before the 1pm ET games: today's OUT list
         outs = sorted((pid for pid, p in players.items() if p.get("injury_status") in ("Out", "Doubtful") and relevant(pid, p["position"]) and pid in red), key=lambda x: red[x]["rank"])[:8]
         if len(outs) >= 3:
-            events.append((1950, f"weekly:sunday:{wk}", "🚫 Out or doubtful today, fantasy-relevant:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in outs) + "\n\nCheck your lineups before kickoff."))
+            events.append((1950, f"weekly:sunday:{wk}", "🚫 Out or doubtful today, fantasy-relevant:\n\n" + "\n".join(f"• {info(x)[0]} ({info(x)[1]}, {info(x)[2]})" for x in outs) + "\n\nCheck your lineups before kickoff.",
+                           dict(title="Out or doubtful today", subtitle="Check your lineup before kickoff", badge="SUNDAY",
+                                rows=[(f"{info(x)[0]} ({info(x)[1]}, {info(x)[2]})", players[x]["injury_status"].upper(), "bad") for x in outs[:6]])))
 
     # polls (replies + reach) and the Tuesday awards; options must be 25 characters or fewer
     polls = {}
@@ -303,6 +359,41 @@ def main(dry):
             _, pos, a, b = best
             key = f"poll:startsit:{wk}"; polls[key] = [short(a), short(b)]
             events.append((1600, key, f"🤔 Week {nfl.get('week')} flex call ({pos}):\n\n{info(a)[0]} ({info(a)[2]}): {pts[a]:.1f} projected\n{info(b)[0]} ({info(b)[2]}): {pts[b]:.1f} projected\n\nThe projections can't split them. Who are you starting?"))
+    if now.weekday() == 0 and now.hour >= 16:  # Monday: "accept or decline?" on a dead-even dynasty trade (people argue in the replies)
+        rnd = random.Random(wk)
+        top = [(pid, x) for pid, x in sorted(dyn.items(), key=lambda t: t[1]["rank"]) if x["rank"] <= 80 and info(pid)[1] in POS4]
+        pairs = [(a, b) for i, a in enumerate(top) for b in top[i + 1:] if info(a[0])[1] != info(b[0])[1] and abs(a[1]["v"] - b[1]["v"]) / max(a[1]["v"], b[1]["v"]) < 0.025]
+        if pairs:
+            (a, xa), (b, xb) = rnd.choice(pairs)
+            gap = abs(xa["v"] - xb["v"]) / max(xa["v"], xb["v"])
+            key = f"poll:trade:{wk}"; polls[key] = ["Accept", "Decline"]
+            events.append((1750, key, f"📨 Trade offer in your dynasty league (Superflex):\n\nYou get: {info(a)[0]} ({info(a)[1]}, {info(a)[2]})\nYou give: {info(b)[0]} ({info(b)[1]}, {info(b)[2]})\n\n"
+                                      f"Their trade values are {'dead even' if gap < 0.005 else f'within {max(1, round(gap * 100))}%'}. Accept or decline?"))
+    if now.weekday() == 6 and 14 <= now.hour < 17:  # Sunday morning: the matchup take, a lower-projected player in a smash spot vs a higher one in a tough spot
+        try:
+            fpa = fetch(f"{SITE}/data/fpa.json").get("fpa") or {}
+        except Exception:
+            fpa = {}
+        rows = {r["player_id"]: r for r in proj if r.get("player_id") and r.get("opponent")}
+        pts = {pid: (r.get("stats") or {}).get("pts_ppr") or 0 for pid, r in rows.items()}
+        take = None
+        for pos, lo, hi in (("WR", 12, 40), ("RB", 10, 34), ("TE", 6, 18)):
+            ranked = sorted((pid for pid in pts if pmap.get(pid, {}).get("position") == pos and players.get(pid, {}).get("injury_status") not in BAD), key=lambda q: -pts[q])[lo:hi]
+            rk = lambda pid: (fpa.get(rows[pid]["opponent"]) or {}).get(pos + "_rank")
+            for i, hi_p in enumerate(ranked):
+                if (rk(hi_p) or 0) < 28:
+                    continue
+                for lo_p in ranked[i + 1:i + 9]:
+                    if (rk(lo_p) or 99) <= 4 and pts[hi_p] - pts[lo_p] <= 3:
+                        cand = (pts[hi_p] - pts[lo_p], pos, lo_p, hi_p)
+                        take = take if take and take[0] <= cand[0] else cand
+        if take:
+            _, pos, a, b = take
+            ord_ = lambda n: f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+            ra, rb = fpa[rows[a]["opponent"]][pos + "_rank"], fpa[rows[b]["opponent"]][pos + "_rank"]
+            key = f"poll:take:{wk}"; polls[key] = [("Start " + short(a))[:25], ("Start " + short(b))[:25]]
+            events.append((1900, key, f"🔥 Sunday take: start {info(a)[0]} over {info(b)[0]}.\n\n{info(a)[0]} faces {rows[a]['opponent']}, who allow the {ord_(ra)}-most points to {pos}s.\n"
+                                      f"{info(b)[0]} faces {rows[b]['opponent']}, {ord_(rb)} against {pos}s.\n\nProjections have {info(b)[0].split(' ')[-1]} ahead by {pts[b] - pts[a]:.1f}. The matchups say otherwise. Who are you starting?"))
     if now.weekday() == 1 and 13 <= now.hour < 20:  # Tuesday morning: last week's awards, from final stats
         q2 = "&".join(f"position[]={x}" for x in POS4)
         for w in (int(nfl.get("week") or 1), int(nfl.get("week") or 1) - 1):
@@ -324,13 +415,17 @@ def main(dry):
             bust = min(proj_top, key=lambda q: act[q] - pj[q], default=None)
             if len(tops) == 4 and boom and bust:
                 events.append((2100, f"weekly:awards:{wk}", f"🏆 Week {w} fantasy awards (PPR):\n\n" + "\n".join(tops)
-                               + f"\n\n💥 Boom: {info(boom)[0]}, {act[boom]:.1f} (projected {pj[boom]:.1f})\n🫥 Bust: {info(bust)[0]}, {act[bust]:.1f} (projected {pj[bust]:.1f})\n\nWho won your league's week?"))
+                               + f"\n\n💥 Boom: {info(boom)[0]}, {act[boom]:.1f} (projected {pj[boom]:.1f})\n🫥 Bust: {info(bust)[0]}, {act[bust]:.1f} (projected {pj[bust]:.1f})\n\nWho won your league's week?",
+                               dict(title=f"Week {w} fantasy awards", subtitle="PPR points", rows=[(f"Top {t.split(':')[0]}: {t.split(': ', 1)[1].rsplit(' (', 1)[0]}", t.rsplit("(", 1)[1].rstrip(")"), "good") for t in tops]
+                                    + [(f"Boom: {info(boom)[0]} (proj {pj[boom]:.1f})", f"{act[boom]:.1f}", "good"), (f"Bust: {info(bust)[0]} (proj {pj[bust]:.1f})", f"{act[bust]:.1f}", "bad")])))
 
     out = []
-    for score, key, text in sorted(events, key=lambda e: -e[0]):
+    for score, key, text, *spec in sorted(events, key=lambda e: -e[0]):
         if key in posted or len(out) >= PER_RUN or sent_today + len(out) >= PER_DAY:
             continue
-        out.append((key, text))
+        if key.startswith(("weekly:", "poll:")) and not peak:  # roundups and debates wait for when people are scrolling; news doesn't
+            continue
+        out.append((key, text, spec[0] if spec else None))
 
     if not prev:
         out = []  # first run: just learn everyone's current status
@@ -340,19 +435,24 @@ def main(dry):
     for it in (json.load(open(sched)) if os.path.exists(sched) else []):
         at = datetime.datetime.fromisoformat(it["at"].replace("Z", "+00:00"))
         if at <= now < at + datetime.timedelta(hours=6) and it["key"] not in posted:
-            out.append((it["key"], it["text"]))
+            out.append((it["key"], it["text"], it.get("card")))
             if it.get("link"):
                 links.add(it["key"])
-    for key, text in out:
+    for key, text, spec in out:
+        png = make_card(spec) if spec and key not in polls else None  # X doesn't allow a poll and an image together
         if live:
-            code, res = post_x(text, allow_link=key in links, poll=polls.get(key))
-            print(f"[{code}] {key} -> {res}")
+            media = upload_media(png) if png else None
+            code, res = post_x(text, allow_link=key in links, poll=polls.get(key), media=media)
+            print(f"[{code}] {key} -> {res}{' (with image)' if media else ''}")
             if code not in (200, 201):
                 continue
         else:
-            print(f"--- DRY RUN ({key}) ---\n{text}\n" + (f"[poll] {polls[key]}\n" if key in polls else ""))
+            print(f"--- DRY RUN ({key}) ---\n{text}\n" + (f"[poll] {polls[key]}\n" if key in polls else "") + ("[image]\n" if png else ""))
+            if png:
+                os.makedirs(os.path.join(HERE, "dry-cards"), exist_ok=True)
+                open(os.path.join(HERE, "dry-cards", key.replace(":", "_") + ".png"), "wb").write(png)
         posted[key] = now.isoformat()
-    sent_today += len(out) if not live else sum(1 for k, _ in out if k in posted)
+    sent_today += len(out) if not live else sum(1 for k, *_ in out if k in posted)
 
     cutoff = now - datetime.timedelta(days=14)
     posted = {k: v for k, v in posted.items() if datetime.datetime.fromisoformat(v) > cutoff}
