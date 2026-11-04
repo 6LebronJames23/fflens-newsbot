@@ -144,8 +144,6 @@ def run(rep, pin, me_id, live, now, x):
                 continue
         else:
             print(f"--- DRY REPLY to {t['id']} ---\n{text}\n" + ("[image]\n" if png else ""))
-        if team and png:
-            rep.setdefault("leagues", {})[team["lid"]] = [team["league"], team["rid"], day]  # candidates for the Sunday race post
         rep["users"][a] = rep["users"].get(a, 0) + 1
         rep["n"] += 1
         sent += 1
@@ -155,19 +153,13 @@ def run(rep, pin, me_id, live, now, x):
         rep["done"] = dict(list(done.items())[-2000:])
 
 
-DEFAULT_RACE = ("1327872832864022528", None)  # fallback league for the Sunday race post when nobody has asked yet
+RACE_LEAGUE = "1327872832864022528"  # Falcon Fiends (the owner's league): never post other people's leagues
 
 
 def race(rep, now):
-    """Sunday post: one real league's playoff race (a league someone asked about this week, else the default) -> (png, text) or None"""
-    day = now.date()
-    recent = sorted(((v[2], lid, v[1]) for lid, v in (rep.get("leagues") or {}).items()
-                     if (day - __import__("datetime").date.fromisoformat(v[2])).days <= 7 and lid not in (rep.get("raced") or [])), reverse=True)
-    for _, lid, rid in recent + [(None,) + DEFAULT_RACE]:
-        png, txt = render(lid, rid, "#shRace")
-        if not png:
-            continue
-        rep.setdefault("raced", []).append(lid); rep["raced"] = rep["raced"][-30:]
+    """Sunday post: Falcon Fiends' playoff race -> (png, text) or None"""
+    png, txt = render(RACE_LEAGUE, None, "#shRace")
+    if png:
         lines = [l for l in txt.split("\n") if l and "http" not in l]
         name = lines[0].split(": playoff race")[0]
         body = sorted(lines[1:], key=lambda l: not l.startswith("🫧"))  # the bubble is the story; other lines go first if it's too long
